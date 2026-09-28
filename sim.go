@@ -1,4 +1,8 @@
 // 包 gamepool 的帧循环：子弹生成、移动、到期，特效跟随。
+//
+// 子弹存放在实体池里；特效只是死亡子弹的短暂视觉残留，不再占用池槽位，
+// 也不持有可写的池实体。特效跟随旧主人时必须通过代次校验，旧句柄在
+// 槽位回收的一刻就失效，因此残留数据不可能写到复用该槽的新子弹身上。
 package gamepool
 
 // Stats 是仿真统计。
@@ -14,22 +18,29 @@ type Stats struct {
 }
 
 // Sim 是单线程的游戏循环。
-type effectLink struct {
-	owner Handle
-	id    int
+type effectState struct {
+	owner   Handle
+	ownerID int
+	x       float64
+	y       float64
+	life    int
 }
 
 type Sim struct {
 	pool    *Pool
 	bullets map[Handle]bool
-	effects map[Handle]effectLink
+	effects map[int]effectState
 	stats   Stats
 	nextID  int
 }
 
 // NewSim 建仿真。
 func NewSim(capacity int) *Sim {
-	return &Sim{pool: New(capacity), bullets: map[Handle]bool{}, effects: map[Handle]effectLink{}}
+	return &Sim{
+		pool:    New(capacity),
+		bullets: map[Handle]bool{},
+		effects: map[int]effectState{},
+	}
 }
 
 // Pool 返回底层实体池（诊断用）。
@@ -46,23 +57,14 @@ func (s *Sim) Stats() Stats {
 	return snapshot
 }
 
-// Step 走一帧。
-// 缺陷：子弹到期时特效系统也会去回收它（重复归还），特效还会通过过期句柄写实体（幽灵写入）。
+// Step 走一帧：先推进老子弹并回收到期的，再生成新子弹，最后更新特效。
 func (s *Sim) Step(spawnPerFrame int) {
 	s.stats.Frames++
-	for index := 0; index < spawnPerFrame; index++ {
-		s.nextID++
-		handle, ok := s.pool.Spawn(Entity{Kind: "bullet", ID: s.nextID, X: -20, Y: float64(index), VX: 3, Life: 30})
-		if !ok {
-			s.stats.Dropped++
-			continue
-		}
-		s.bullets[handle] = true
-		s.stats.Spawned++
-	}
+
 	for handle := range s.bullets {
 		entity, ok := s.pool.Get(handle)
 		if !ok {
+			// 句柄已失效（正常情况下不会发生），只清理本地登记。
 			delete(s.bullets, handle)
 			continue
 		}
@@ -73,37 +75,51 @@ func (s *Sim) Step(spawnPerFrame int) {
 			continue
 		}
 		bulletID := entity.ID
-		s.pool.Release(handle)
-		s.stats.Released++
+		deathX, deathY := entity.X, entity.Y
+		if s.pool.Release(handle) {
+			s.stats.Released++
+		}
 		delete(s.bullets, handle)
 		s.nextID++
-		effect, ok := s.pool.Spawn(Entity{Kind: "effect", ID: s.nextID, X: entity.X, Y: entity.Y, Life: 5})
-		if ok {
-			s.effects[effect] = effectLink{owner: handle, id: bulletID}
+		s.effects[s.nextID] = effectState{
+			owner:   handle, // 已随回收失效，特效只能用它做只读的代次校验
+			ownerID: bulletID,
+			x:       deathX,
+			y:       deathY,
+			life:    5,
 		}
 	}
-	for effect, link := range s.effects {
-		entity, ok := s.pool.Get(effect)
+
+	for index := 0; index < spawnPerFrame; index++ {
+		s.nextID++
+		handle, ok := s.pool.Spawn(Entity{
+			Kind: "bullet", ID: s.nextID,
+			X: -20, Y: float64(index), VX: 3, Life: 30,
+		})
 		if !ok {
-			delete(s.effects, effect)
+			s.stats.Dropped++
 			continue
 		}
-		entity.Life--
-		if ownerEntity, ok := s.pool.Get(link.owner); ok {
-			ownerEntity.X += 0.5 // 特效系统往「跟随的子弹」上写残留数据
-			if ownerEntity.ID != link.id {
-				// 这个槽已经被别的子弹复用了，写入落到了别人身上（幽灵写入）
+		s.bullets[handle] = true
+		s.stats.Spawned++
+	}
+
+	for id, effect := range s.effects {
+		effect.life--
+		effect.x += 0.5
+		// 跟随旧主人：句柄在子弹回收时已经换代，Get 必失败，
+		// 因此不会有任何写入落到复用该槽的新子弹身上。
+		if ownerEntity, ok := s.pool.Get(effect.owner); ok {
+			ownerEntity.X += 0.5
+			if ownerEntity.ID != effect.ownerID {
 				s.stats.GhostWrites++
 			}
 		}
-		if entity.Life > 0 {
+		if effect.life <= 0 {
+			delete(s.effects, id)
 			continue
 		}
-		s.pool.Release(link.owner) // 缺陷：子弹可能早就回收过了，这里会重复归还
-		s.stats.Released++
-		s.pool.Release(effect)
-		s.stats.Released++
-		delete(s.effects, effect)
+		s.effects[id] = effect
 	}
 }
 
@@ -130,6 +146,7 @@ func StaleCheck() (accepted bool, generationChanged bool) {
 	if second.Index != first.Index {
 		return false, false
 	}
-	entity, ok := pool.Get(first)
-	return ok && entity.ID == 2, pool.GenerationOf(first.Index) != first.Generation
+	_, accepted = pool.Get(first)
+	generationChanged = pool.GenerationOf(first.Index) != first.Generation
+	return accepted, generationChanged
 }

@@ -1,8 +1,11 @@
-// Package gamepool 是游戏实体池：子弹与特效复用固定容量的槽位。
-// 缺陷：Release 不校验重复归还、也不递增代次；Get 只比下标不比代次。
+// Package gamepool 是游戏实体池：子弹复用固定容量的槽位。
+//
+// 槽位带代次（generation）：每次回收时代次加一，句柄必须同时匹配
+// 下标与代次才能访问槽位。inUse 占用位让 Spawn/Release/Get 全部 O(1)，
+// 重复归还、过期句柄都会被直接拒绝，空闲栈不可能出现重复下标。
 package gamepool
 
-// Handle 是实体句柄。
+// Handle 是实体句柄：下标 + 槽位代次。
 type Handle struct {
 	Index      uint32
 	Generation uint32
@@ -23,6 +26,7 @@ type Entity struct {
 type Pool struct {
 	entries     []Entity
 	generations []uint32
+	inUse       []bool
 	free        []uint32
 	alive       int
 }
@@ -35,6 +39,7 @@ func New(capacity int) *Pool {
 	pool := &Pool{
 		entries:     make([]Entity, capacity),
 		generations: make([]uint32, capacity),
+		inUse:       make([]bool, capacity),
 	}
 	for index := capacity - 1; index >= 0; index-- {
 		pool.free = append(pool.free, uint32(index))
@@ -42,8 +47,7 @@ func New(capacity int) *Pool {
 	return pool
 }
 
-// Spawn 取一个空槽。
-// 缺陷：池空时只回 false，既没区分「丢弃」也没把丢弃记进统计。
+// Spawn 取一个空槽。池满时返回 false（由调用方计入丢弃统计）。
 func (p *Pool) Spawn(entity Entity) (Handle, bool) {
 	if len(p.free) == 0 {
 		return Handle{}, false
@@ -51,23 +55,34 @@ func (p *Pool) Spawn(entity Entity) (Handle, bool) {
 	index := p.free[len(p.free)-1]
 	p.free = p.free[:len(p.free)-1]
 	p.entries[index] = entity
+	p.inUse[index] = true
 	p.alive++
 	return Handle{Index: index, Generation: p.generations[index]}, true
 }
 
-// Get 缺陷：只比下标不比代次，过期句柄也能拿到槽里的新实体。
+// Get 同时比对下标与代次：越界、空闲槽、过期句柄一律拒绝。
 func (p *Pool) Get(handle Handle) (*Entity, bool) {
 	if int(handle.Index) >= len(p.entries) {
+		return nil, false
+	}
+	if !p.inUse[handle.Index] || p.generations[handle.Index] != handle.Generation {
 		return nil, false
 	}
 	return &p.entries[handle.Index], true
 }
 
-// Release 缺陷：不检查重复归还，也不递增代次。
+// Release 回收槽位。只有「下标有效、槽位在用、代次匹配」的句柄才能回收：
+// 重复归还、过期句柄、越界下标都返回 false，不入栈也不动计数。
+// 回收成功时代次加一，使指向该槽的旧句柄全部失效。
 func (p *Pool) Release(handle Handle) bool {
 	if int(handle.Index) >= len(p.entries) {
 		return false
 	}
+	if !p.inUse[handle.Index] || p.generations[handle.Index] != handle.Generation {
+		return false
+	}
+	p.inUse[handle.Index] = false
+	p.generations[handle.Index]++
 	p.free = append(p.free, handle.Index)
 	p.alive--
 	return true
@@ -96,15 +111,26 @@ func (p *Pool) Free() int {
 	return len(p.free)
 }
 
-// Consistent 是诊断接口：检查空闲栈里有没有重复下标、计数有没有越界。
-// 缺陷：现在只能靠扫描发现重复下标，说明「一个槽被归还两次」这种状态是可能出现的。
+// Consistent 是诊断接口：检查计数、空闲栈重复下标以及占用位与计数是否自洽。
 func (p *Pool) Consistent() bool {
-	if p.alive < 0 || len(p.free) > len(p.entries) {
+	if p.alive < 0 || p.alive > len(p.entries) || len(p.free) > len(p.entries) {
+		return false
+	}
+	if p.alive+len(p.free) != len(p.entries) {
 		return false
 	}
 	seen := make([]bool, len(p.entries))
+	used := 0
+	for _, inUse := range p.inUse {
+		if inUse {
+			used++
+		}
+	}
+	if used != p.alive {
+		return false
+	}
 	for _, index := range p.free {
-		if int(index) >= len(p.entries) || seen[index] {
+		if int(index) >= len(p.entries) || p.inUse[index] || seen[index] {
 			return false
 		}
 		seen[index] = true
